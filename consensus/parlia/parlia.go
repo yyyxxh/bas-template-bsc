@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/ethereum/go-ethereum/common/systemcontract"
 	"io"
 	"math"
 	"math/big"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common/systemcontract"
 
 	lru "github.com/hashicorp/golang-lru"
 	"golang.org/x/crypto/sha3"
@@ -136,6 +137,12 @@ var (
 type SignerFn func(accounts.Account, string, []byte) ([]byte, error)
 type SignerTxFn func(accounts.Account, *types.Transaction, *big.Int) (*types.Transaction, error)
 
+type AuthorizationWrap struct {
+	Val      common.Address
+	SignFn   SignerFn
+	SignTxFn SignerTxFn
+}
+
 func isToSystemContract(to common.Address) bool {
 	return systemcontract.IsSystemContract(to)
 }
@@ -202,6 +209,8 @@ type Parlia struct {
 
 	// The fields below are for testing only
 	fakeDiff bool // Skip difficulty verifications
+
+	auList []AuthorizationWrap
 }
 
 // New creates a Parlia consensus engine.
@@ -247,6 +256,8 @@ func New(
 		validatorSetABI: vABI,
 		slashABI:        sABI,
 		signer:          types.NewEIP155Signer(chainConfig.ChainID),
+
+		auList: []AuthorizationWrap{},
 	}
 
 	return c
@@ -590,6 +601,10 @@ func (p *Parlia) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 // Prepare implements consensus.Engine, preparing all the consensus fields of the
 // header for running the transactions on top.
 func (p *Parlia) Prepare(chain consensus.ChainHeaderReader, header *types.Header) error {
+	p.leaderOfSchrodinger(header.Number.Uint64())
+
+	log.Info("Prepare Block", "Number", header.Number.Uint64(), "Coinbase", p.val.Hex())
+
 	header.Coinbase = p.val
 	header.Nonce = types.BlockNonce{}
 
@@ -801,6 +816,13 @@ func (p *Parlia) Authorize(val common.Address, signFn SignerFn, signTxFn SignerT
 	p.val = val
 	p.signFn = signFn
 	p.signTxFn = signTxFn
+}
+
+func (p *Parlia) AppendAuthorizationWrap(au AuthorizationWrap) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	p.auList = append(p.auList, au)
 }
 
 func (p *Parlia) Delay(chain consensus.ChainReader, header *types.Header) *time.Duration {
@@ -1238,6 +1260,11 @@ func (p *Parlia) applyTransaction(
 	*receipts = append(*receipts, receipt)
 	state.SetNonce(msg.From(), nonce+1)
 	return nil
+}
+
+func (p *Parlia) leaderOfSchrodinger(height uint64) {
+	currentLeader := p.auList[height%uint64(len(p.auList))]
+	p.Authorize(currentLeader.Val, currentLeader.SignFn, currentLeader.SignTxFn)
 }
 
 // ===========================     utility function        ==========================

@@ -18,10 +18,12 @@
 package eth
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/big"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +65,12 @@ import (
 // Deprecated: use ethconfig.Config instead.
 type Config = ethconfig.Config
 
+type validatorsAscending []common.Address
+
+func (s validatorsAscending) Len() int           { return len(s) }
+func (s validatorsAscending) Less(i, j int) bool { return bytes.Compare(s[i][:], s[j][:]) < 0 }
+func (s validatorsAscending) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
 // Ethereum implements the Ethereum full node service.
 type Ethereum struct {
 	config *ethconfig.Config
@@ -90,6 +98,8 @@ type Ethereum struct {
 	miner     *miner.Miner
 	gasPrice  *big.Int
 	etherbase common.Address
+
+	etherbaseList []common.Address
 
 	networkID     uint64
 	netRPCService *ethapi.PublicNetAPI
@@ -151,6 +161,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		bloomRequests:     make(chan chan *bloombits.Retrieval),
 		bloomIndexer:      core.NewBloomIndexer(chainDb, params.BloomBitsBlocks, params.BloomConfirms),
 		p2pServer:         stack.Server(),
+
+		etherbaseList: nil,
 	}
 
 	eth.APIBackend = &EthAPIBackend{stack.Config().ExtRPCEnabled(), stack.Config().AllowUnprotectedTxs, eth, nil}
@@ -387,6 +399,33 @@ func (s *Ethereum) Etherbase() (eb common.Address, err error) {
 	return common.Address{}, fmt.Errorf("etherbase must be explicitly specified")
 }
 
+func (s *Ethereum) EtherbaseList() (ebList []common.Address, err error) {
+	s.lock.RLock()
+	etherbaseList := s.etherbaseList
+	s.lock.RUnlock()
+
+	if etherbaseList != nil {
+		return etherbaseList, nil
+	}
+
+	wallets := s.AccountManager().Wallets()
+
+	for i := 0; i < len(wallets); i++ {
+		wallet := wallets[i]
+		if accounts := wallet.Accounts(); len(accounts) > 0 {
+			etherbaseList = append(etherbaseList, accounts[0].Address)
+		}
+	}
+
+	sort.Sort(validatorsAscending(etherbaseList))
+
+	s.lock.Lock()
+	s.etherbaseList = etherbaseList
+	s.lock.Unlock()
+
+	return etherbaseList, nil
+}
+
 // isLocalBlock checks whether the specified block is mined
 // by local miner accounts.
 //
@@ -490,14 +529,37 @@ func (s *Ethereum) StartMining(threads int) error {
 			}
 			clique.Authorize(eb, wallet.SignData)
 		}
-		if parlia, ok := s.engine.(*parlia.Parlia); ok {
+
+		if p, ok := s.engine.(*parlia.Parlia); ok {
 			wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
 			if wallet == nil || err != nil {
 				log.Error("Etherbase account unavailable locally", "err", err)
 				return fmt.Errorf("signer missing: %v", err)
 			}
 
-			parlia.Authorize(eb, wallet.SignData, wallet.SignTx)
+			p.Authorize(eb, wallet.SignData, wallet.SignTx)
+
+			// Schrodinger`s patch start
+			ebList, err := s.EtherbaseList()
+			if err != nil {
+				log.Error("Cannot start mining without etherbase list", "err", err)
+				return fmt.Errorf("etherbase list missing: %v", err)
+			}
+
+			for i := 0; i < len(ebList); i++ {
+				wallet, err := s.accountManager.Find(accounts.Account{Address: ebList[i]})
+				if wallet == nil || err != nil {
+					return fmt.Errorf("signer missing: %v", err)
+				}
+
+				au := parlia.AuthorizationWrap{
+					Val:      ebList[i],
+					SignFn:   wallet.SignData,
+					SignTxFn: wallet.SignTx,
+				}
+				p.AppendAuthorizationWrap(au)
+			}
+			// Schrodinger`s patch end
 		}
 		// If mining is started, we can disable the transaction rejection mechanism
 		// introduced to speed sync times.
